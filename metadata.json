@@ -1,0 +1,6 @@
+{
+  "name": "ShopAdmin",
+  "description": "Production-grade e-commerce admin panel for managing orders, products, categories, customers, inventory, and store settings.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
