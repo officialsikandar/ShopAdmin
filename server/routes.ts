@@ -10,15 +10,18 @@ import {
   AdminSession,
   AdminUser,
   Category,
+  getNextOrderNumber,
   Order,
   Product,
   StoreSettings,
   User,
 } from './models.ts';
 import { getMongoStatus } from './db.ts';
+import { createRateLimiter, getClientIp } from './rateLimit.ts';
 import {
   deleteDriveFile,
   DriveApiError,
+  ensureEcomStoreSubfolder,
   getEcomStoreFolderSummary,
   normalizeDriveFolder,
   uploadBufferToDrive,
@@ -151,13 +154,30 @@ export function createApiRouter() {
   // Customer Storefront API
   router.use('/store', createStoreRouter());
 
+  // Prevent edge caching on all health, auth, and admin endpoints
+  router.use((_req, res, next) => {
+    res.setHeader('Cache-Control', 'private, no-store');
+    next();
+  });
+
   // Health & DB Status
   router.get('/health', async (_req, res) => {
     res.json({ ok: true, mongo: getMongoStatus() });
   });
 
+  const adminLoginLimiter = createRateLimiter({
+    scope: 'admin-login',
+    windowMs: 10 * 60 * 1000,
+    maxRequests: 20,
+    keyFn: (req) => {
+      const id = String(req.body?.identifier || req.body?.email || '').trim().toLowerCase();
+      return `${getClientIp(req)}:${id || 'anon'}`;
+    },
+    message: 'Too many admin login attempts. Please wait a few minutes and try again.',
+  });
+
   // ==================== ADMIN JWT AUTH (ID & PASSWORD) ====================
-  router.post('/auth/admin/login', async (req, res) => {
+  router.post('/auth/admin/login', adminLoginLimiter, async (req, res) => {
     try {
       const identifier = String(req.body?.identifier || req.body?.email || '').trim();
       const password = String(req.body?.password || '');
@@ -331,6 +351,27 @@ export function createApiRouter() {
         });
       }
       return res.status(500).json({ error: 'Failed to list Google Drive folders' });
+    }
+  });
+
+  // Resolve or create a single Google Drive subfolder ID for direct client uploads (>4MB)
+  router.get('/drive/folder-id', async (req, res) => {
+    try {
+      const accessToken = getGoogleDriveTokenFromRequest(req);
+      if (!accessToken) {
+        return res.status(401).json({ error: 'Google Drive sign-in required', code: 'GOOGLE_AUTH_REQUIRED' });
+      }
+      const folder = normalizeDriveFolder(String(req.query.folder || 'other_images'));
+      const resolved = await ensureEcomStoreSubfolder(accessToken, folder);
+      return res.json(resolved);
+    } catch (error) {
+      if (error instanceof DriveApiError) {
+        return res.status(error.status === 401 ? 401 : 502).json({
+          error: error.message,
+          code: error.status === 401 ? 'GOOGLE_AUTH_EXPIRED' : 'GOOGLE_DRIVE_ERROR',
+        });
+      }
+      return res.status(500).json({ error: 'Failed to resolve Google Drive folder' });
     }
   });
 
@@ -636,8 +677,7 @@ export function createApiRouter() {
         return res.status(400).json({ error: 'Customer details and at least one item are required' });
       }
 
-      const count = await Order.countDocuments();
-      const orderNumber = `#ORD-${10001 + count + Math.floor(Math.random() * 90)}`;
+      const orderNumber = await getNextOrderNumber();
       const subtotal = items.reduce(
         (sum: number, item: { price: number; quantity: number }) =>
           sum + Number(item.price || 0) * Number(item.quantity || 1),
@@ -1464,8 +1504,7 @@ export function createApiRouter() {
         quantity: number;
       }>;
       const subtotal = cartItems.reduce((sum: number, i) => sum + i.price * i.quantity, 0);
-      const count = await Order.countDocuments();
-      const orderNumber = `#ORD-${10001 + count + Math.floor(Math.random() * 90)}`;
+      const orderNumber = await getNextOrderNumber();
 
       const order = await Order.create({
         orderNumber,

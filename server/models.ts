@@ -401,6 +401,44 @@ const couponSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+categorySchema.index({ status: 1, name: 1 });
+
+productSchema.index({ status: 1, createdAt: -1 });
+productSchema.index({ status: 1, isFeatured: -1, createdAt: -1 });
+productSchema.index({ status: 1, categoryId: 1, createdAt: -1 });
+productSchema.index({ status: 1, categoryName: 1, createdAt: -1 });
+productSchema.index({ status: 1, price: 1 });
+productSchema.index({ status: 1, discountPercent: -1 });
+
+userSchema.index({ user_role: 1, status: 1, createdAt: -1 });
+
+orderSchema.index({ userId: 1, createdAt: -1 });
+orderSchema.index({ customerEmail: 1, createdAt: -1 });
+orderSchema.index({ status: 1, createdAt: -1 });
+orderSchema.index({ createdAt: -1 });
+
+otpVerificationSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+customerSessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+adminSessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+const rateLimitBucketSchema = new mongoose.Schema(
+  {
+    key: { type: String, required: true, unique: true },
+    count: { type: Number, required: true, default: 1 },
+    expiresAt: { type: Date, required: true },
+  },
+  { timestamps: false }
+);
+rateLimitBucketSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+const sequenceCounterSchema = new mongoose.Schema(
+  {
+    _id: { type: String, required: true },
+    seq: { type: Number, required: true, default: 10000 },
+  },
+  { versionKey: false }
+);
+
 export const Category = mongoose.models.Category || mongoose.model('Category', categorySchema);
 export const Product = mongoose.models.Product || mongoose.model('Product', productSchema);
 export const User = mongoose.models.User || mongoose.model('User', userSchema);
@@ -415,3 +453,26 @@ export const CustomerSession =
 export const AdminSession =
   mongoose.models.AdminSession || mongoose.model('AdminSession', adminSessionSchema);
 export const Coupon = mongoose.models.Coupon || mongoose.model('Coupon', couponSchema);
+export const RateLimitBucket =
+  mongoose.models.RateLimitBucket || mongoose.model('RateLimitBucket', rateLimitBucketSchema);
+export const SequenceCounter =
+  mongoose.models.SequenceCounter || mongoose.model('SequenceCounter', sequenceCounterSchema);
+
+export async function getNextOrderNumber(): Promise<string> {
+  const existing = await SequenceCounter.findById('orderNumber').lean();
+  if (!existing) {
+    const baseCount = await Order.countDocuments();
+    const initialSeq = 10050 + baseCount;
+    await SequenceCounter.updateOne(
+      { _id: 'orderNumber' },
+      { $setOnInsert: { seq: initialSeq } },
+      { upsert: true }
+    );
+  }
+  const updated = await SequenceCounter.findOneAndUpdate(
+    { _id: 'orderNumber' },
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  );
+  return `#ORD-${updated?.seq || Date.now()}`;
+}

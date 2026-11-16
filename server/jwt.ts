@@ -32,8 +32,20 @@ function getJwtSecret(): string {
   if (cachedSecret) return cachedSecret;
 
   const envSecret = process.env.JWT_SECRET?.trim();
-  if (envSecret && envSecret.length >= 16) {
+  if (envSecret && envSecret.length >= 8) {
     cachedSecret = envSecret;
+    return cachedSecret;
+  }
+
+  // On serverless platforms (e.g. Vercel), local disk (.data/jwt.secret) is not shared
+  // across invocations. Derive a deterministic secret from MONGODB_URI when JWT_SECRET is unset
+  // so tokens remain valid across all warm/cold serverless instances.
+  if (process.env.VERCEL || process.env.NODE_ENV === 'production') {
+    const seed = process.env.MONGODB_URI?.trim() || process.env.APP_URL?.trim() || 'shopadmin-prod-key';
+    cachedSecret = crypto
+      .createHmac('sha256', 'shopadmin-serverless-jwt-v1')
+      .update(seed)
+      .digest('hex');
     return cachedSecret;
   }
 

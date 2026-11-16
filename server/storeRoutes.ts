@@ -3,10 +3,12 @@ import express from 'express';
 import nodemailer from 'nodemailer';
 import mongoose from 'mongoose';
 import { signCustomerJwt, verifyJwtToken } from './jwt.ts';
+import { createRateLimiter, getClientIp } from './rateLimit.ts';
 import {
   Category,
   Coupon,
   CustomerSession,
+  getNextOrderNumber,
   Order,
   OtpVerification,
   Product,
@@ -113,18 +115,35 @@ function formatStoreProduct(p: StoreProductDoc, salesMap?: Map<string, number>) 
   };
 }
 
+const globalForSales = globalThis as typeof globalThis & {
+  __shopAdminSalesCache?: { map: Map<string, number>; expiresAt: number } | null;
+};
+
 async function getProductSalesMap(): Promise<Map<string, number>> {
-  const orders = await Order.find({ status: { $ne: 'Cancelled' } }, 'items').lean();
+  const now = Date.now();
+  const cached = globalForSales.__shopAdminSalesCache;
+  if (cached && cached.expiresAt > now) {
+    return cached.map;
+  }
+
+  const rows = await Order.aggregate<{ _id: mongoose.Types.ObjectId; qty: number }>([
+    { $match: { status: { $ne: 'Cancelled' } } },
+    { $unwind: '$items' },
+    { $match: { 'items.productId': { $ne: null } } },
+    { $group: { _id: '$items.productId', qty: { $sum: '$items.quantity' } } },
+  ]);
+
   const salesMap = new Map<string, number>();
-  for (const order of orders) {
-    const items = (order.items as Array<{ productId?: unknown; quantity?: number }>) || [];
-    for (const item of items) {
-      if (item.productId) {
-        const key = String(item.productId);
-        salesMap.set(key, (salesMap.get(key) || 0) + Number(item.quantity || 0));
-      }
+  for (const row of rows) {
+    if (row._id) {
+      salesMap.set(String(row._id), Number(row.qty || 0));
     }
   }
+
+  globalForSales.__shopAdminSalesCache = {
+    map: salesMap,
+    expiresAt: now + 15_000,
+  };
   return salesMap;
 }
 
@@ -298,9 +317,18 @@ async function findProductBySlugOrId(slugOrId: string) {
   const bySku = await Product.findOne({ sku: trimmed.toUpperCase() }).lean();
   if (bySku) return bySku;
 
-  const allProducts = await Product.find().lean();
+  const escapedNamePattern = trimmed
+    .replace(/-/g, '[\\s-]+')
+    .replace(/[.*+?^${}()|[\]\\]/g, (ch) => (ch === '[' || ch === ']' || ch === '\\' || ch === '+' || ch === '-' ? ch : `\\${ch}`));
+  const byName = await Product.findOne({
+    status: 'Active',
+    name: new RegExp(`^${escapedNamePattern}$`, 'i'),
+  }).lean();
+  if (byName) return byName;
+
+  const fallbackCandidates = await Product.find({ status: 'Active' }, null, { limit: 100 }).lean();
   return (
-    allProducts.find((p) => slugify(p.name) === trimmed.toLowerCase()) || null
+    fallbackCandidates.find((p) => slugify(p.name) === trimmed.toLowerCase()) || null
   );
 }
 
@@ -321,6 +349,43 @@ function sanitizeCustomerUser(user: InstanceType<typeof User>) {
 
 export function createStoreRouter() {
   const router = express.Router();
+
+  // Default to private, no-store; public catalog routes opt into edge CDN caching below
+  router.use((_req, res, next) => {
+    res.setHeader('Cache-Control', 'private, no-store');
+    next();
+  });
+
+  const sendOtpEmailLimiter = createRateLimiter({
+    scope: 'otp-send-email',
+    windowMs: 5 * 60 * 1000,
+    maxRequests: 5,
+    keyFn: (req) => String(req.body?.email || '').trim().toLowerCase() || getClientIp(req),
+    message: 'Too many OTP requests for this email. Please wait a few minutes.',
+  });
+
+  const sendOtpIpLimiter = createRateLimiter({
+    scope: 'otp-send-ip',
+    windowMs: 10 * 60 * 1000,
+    maxRequests: 25,
+    message: 'Too many OTP requests from this network. Please try again shortly.',
+  });
+
+  const verifyOtpLimiter = createRateLimiter({
+    scope: 'otp-verify',
+    windowMs: 10 * 60 * 1000,
+    maxRequests: 15,
+    keyFn: (req) =>
+      `${getClientIp(req)}:${String(req.body?.email || '').trim().toLowerCase() || 'anon'}`,
+    message: 'Too many failed OTP attempts. Please request a new code in a few minutes.',
+  });
+
+  const checkoutLimiter = createRateLimiter({
+    scope: 'store-checkout',
+    windowMs: 5 * 60 * 1000,
+    maxRequests: 15,
+    message: 'Too many checkout requests. Please wait a moment before trying again.',
+  });
 
   // ==================== BOOTSTRAP & HOME ====================
   router.get('/bootstrap', async (req, res) => {
@@ -382,6 +447,7 @@ export function createStoreRouter() {
         .sort((a, b) => b.discountPercent - a.discountPercent)
         .slice(0, 8);
 
+      res.setHeader('Cache-Control', 'public, s-maxage=30, stale-while-revalidate=120');
       res.json({
         categories,
         featuredProducts,
@@ -399,6 +465,7 @@ export function createStoreRouter() {
   router.get('/categories', async (_req, res) => {
     try {
       const categories = await getCategoryCountsList();
+      res.setHeader('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
       res.json({ categories });
     } catch {
       res.status(500).json({ error: 'Failed to load categories' });
@@ -541,6 +608,7 @@ export function createStoreRouter() {
         discount50: allFormatted.filter((p) => p.discountPercent >= 50).length,
       };
 
+      res.setHeader('Cache-Control', 'public, s-maxage=20, stale-while-revalidate=90');
       res.json({
         products: paginated,
         total: list.length,
@@ -589,6 +657,7 @@ export function createStoreRouter() {
         breakdown[star] = (breakdown[star] || 0) + 1;
       }
 
+      res.setHeader('Cache-Control', 'public, s-maxage=20, stale-while-revalidate=90');
       res.json({
         product: formatted,
         ratingBreakdown: breakdown,
@@ -654,7 +723,7 @@ export function createStoreRouter() {
   });
 
   // ==================== CUSTOMER EMAIL OTP AUTH ====================
-  router.post('/auth/send-otp', async (req, res) => {
+  router.post('/auth/send-otp', sendOtpIpLimiter, sendOtpEmailLimiter, async (req, res) => {
     try {
       const email = String(req.body?.email || '').trim().toLowerCase();
       if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -725,7 +794,7 @@ export function createStoreRouter() {
     }
   });
 
-  router.post('/auth/verify-otp', async (req, res) => {
+  router.post('/auth/verify-otp', verifyOtpLimiter, async (req, res) => {
     try {
       const email = String(req.body?.email || '').trim().toLowerCase();
       const otp = String(req.body?.otp || '').trim();
@@ -1273,7 +1342,7 @@ export function createStoreRouter() {
   });
 
   // ==================== CHECKOUT & CUSTOMER ORDERS ====================
-  router.post('/checkout', async (req, res) => {
+  router.post('/checkout', checkoutLimiter, async (req, res) => {
     try {
       const auth = await resolveAuthenticatedCustomer(req);
       if (!auth) {
@@ -1417,59 +1486,103 @@ export function createStoreRouter() {
       const totalAmount = afterCoupon + shippingCost + taxAmount;
       const totalDiscount = productDiscount + couponDiscount;
 
-      const count = await Order.countDocuments();
-      const orderNumber = `#ORD-${10001 + count + Math.floor(Math.random() * 90)}`;
+      const autoUpdateStock = settings?.general?.autoUpdateStock !== false;
+      const reservedItems: Array<{ productId: string; quantity: number }> = [];
 
-      const isOnlinePaid = paymentMethod === 'Razorpay' || paymentMethod === 'Paid';
-
-      const order = await Order.create({
-        orderNumber,
-        userId: auth.user._id,
-        customerName: shippingAddress.fullName || auth.user.name,
-        customerEmail: auth.user.email,
-        customerPhone: shippingAddress.phone || auth.user.phone || '',
-        shippingAddress: {
-          fullName: shippingAddress.fullName || auth.user.name,
-          phone: shippingAddress.phone || auth.user.phone || '',
-          line1: shippingAddress.line1,
-          line2: shippingAddress.line2 || '',
-          city: shippingAddress.city,
-          state: shippingAddress.state,
-          postalCode: shippingAddress.postalCode,
-          country: shippingAddress.country || 'India',
-        },
-        items: orderItems,
-        subtotal: sellingSubtotal,
-        discountAmount: totalDiscount,
-        couponCode: appliedCoupon,
-        shippingCost,
-        shippingMethodName,
-        estimatedDelivery,
-        taxAmount,
-        totalAmount,
-        paymentMethod: isOnlinePaid ? 'Razorpay' : 'COD',
-        paymentStatus: isOnlinePaid ? 'Paid' : 'Pending',
-        razorpayPaymentId,
-        confirmationEmailSent: false,
-        status: 'Placed',
-        timeline: [
-          {
-            status: 'Placed',
-            note: `Order placed via storefront (${isOnlinePaid ? 'Online Payment' : 'Cash on Delivery'})`,
-            timestamp: new Date(),
-          },
-        ],
-      });
-
-      // Decrement stock in MongoDB
-      if (settings?.general?.autoUpdateStock !== false) {
-        for (const reqItem of rawItems) {
-          const prod = productMap.get(reqItem.productId);
-          if (prod) {
-            prod.stock = Math.max(0, prod.stock - reqItem.quantity);
-            await prod.save();
+      const rollbackReservedStock = async () => {
+        for (const item of reservedItems) {
+          try {
+            await Product.updateOne(
+              { _id: item.productId },
+              { $inc: { stock: item.quantity } }
+            );
+          } catch (rollbackErr) {
+            console.error('Stock rollback error:', rollbackErr);
           }
         }
+      };
+
+      // Atomically decrement stock BEFORE creating the order to prevent overselling under concurrency
+      if (autoUpdateStock) {
+        const aggregatedByProduct = new Map<string, number>();
+        for (const reqItem of rawItems) {
+          aggregatedByProduct.set(
+            reqItem.productId,
+            (aggregatedByProduct.get(reqItem.productId) || 0) + reqItem.quantity
+          );
+        }
+        const sortedEntries = [...aggregatedByProduct.entries()].sort((a, b) =>
+          a[0].localeCompare(b[0])
+        );
+
+        for (const [productId, qty] of sortedEntries) {
+          const updated = await Product.findOneAndUpdate(
+            { _id: productId, status: 'Active', stock: { $gte: qty } },
+            { $inc: { stock: -qty } },
+            { new: true }
+          );
+          if (!updated) {
+            await rollbackReservedStock();
+            const latest = await Product.findById(productId, 'name stock status').lean();
+            if (!latest || latest.status !== 'Active' || latest.stock <= 0) {
+              return res.status(409).json({
+                error: `${latest?.name || 'This product'} is currently out of stock.`,
+              });
+            }
+            return res.status(409).json({
+              error: `Only ${latest.stock} unit(s) available for ${latest.name}.`,
+            });
+          }
+          reservedItems.push({ productId, quantity: qty });
+        }
+      }
+
+      const orderNumber = await getNextOrderNumber();
+      const isOnlinePaid = paymentMethod === 'Razorpay' || paymentMethod === 'Paid';
+
+      let order;
+      try {
+        order = await Order.create({
+          orderNumber,
+          userId: auth.user._id,
+          customerName: shippingAddress.fullName || auth.user.name,
+          customerEmail: auth.user.email,
+          customerPhone: shippingAddress.phone || auth.user.phone || '',
+          shippingAddress: {
+            fullName: shippingAddress.fullName || auth.user.name,
+            phone: shippingAddress.phone || auth.user.phone || '',
+            line1: shippingAddress.line1,
+            line2: shippingAddress.line2 || '',
+            city: shippingAddress.city,
+            state: shippingAddress.state,
+            postalCode: shippingAddress.postalCode,
+            country: shippingAddress.country || 'India',
+          },
+          items: orderItems,
+          subtotal: sellingSubtotal,
+          discountAmount: totalDiscount,
+          couponCode: appliedCoupon,
+          shippingCost,
+          shippingMethodName,
+          estimatedDelivery,
+          taxAmount,
+          totalAmount,
+          paymentMethod: isOnlinePaid ? 'Razorpay' : 'COD',
+          paymentStatus: isOnlinePaid ? 'Paid' : 'Pending',
+          razorpayPaymentId,
+          confirmationEmailSent: false,
+          status: 'Placed',
+          timeline: [
+            {
+              status: 'Placed',
+              note: `Order placed via storefront (${isOnlinePaid ? 'Online Payment' : 'Cash on Delivery'})`,
+              timestamp: new Date(),
+            },
+          ],
+        });
+      } catch (orderErr) {
+        await rollbackReservedStock();
+        throw orderErr;
       }
 
       // Clear cart if standard cart checkout

@@ -2,62 +2,113 @@ import fs from 'node:fs';
 import path from 'node:path';
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
-import { MongoMemoryServer } from 'mongodb-memory-server';
 import { AdminUser, StoreSettings, User } from './models.ts';
 
-let memoryServer: MongoMemoryServer | null = null;
-let connectionMode: 'external' | 'embedded' = 'embedded';
+type MemoryServerInstance = {
+  getUri: (dbName?: string) => string;
+  stop: () => Promise<boolean>;
+};
+
+const globalForMongo = globalThis as typeof globalThis & {
+  __shopAdminMongoPromise?: Promise<typeof mongoose> | null;
+  __shopAdminCoreInitPromise?: Promise<void> | null;
+  __shopAdminMemoryServer?: MemoryServerInstance | null;
+  __shopAdminConnectionMode?: 'external' | 'embedded';
+};
 
 export function getMongoStatus() {
   return {
     connected: mongoose.connection.readyState === 1,
-    mode: connectionMode,
+    mode: globalForMongo.__shopAdminConnectionMode || (process.env.MONGODB_URI?.trim() ? 'external' : 'embedded'),
     dbName: mongoose.connection.name || 'ecom_store',
   };
 }
 
 export async function connectToMongoDB() {
   if (mongoose.connection.readyState === 1) {
+    if (!globalForMongo.__shopAdminCoreInitPromise) {
+      globalForMongo.__shopAdminCoreInitPromise = ensureCoreSystemConfig().catch((err) => {
+        globalForMongo.__shopAdminCoreInitPromise = null;
+        throw err;
+      });
+    }
+    await globalForMongo.__shopAdminCoreInitPromise;
     return;
   }
 
-  let uri = process.env.MONGODB_URI?.trim();
+  if (!globalForMongo.__shopAdminMongoPromise) {
+    globalForMongo.__shopAdminMongoPromise = (async () => {
+      let uri = process.env.MONGODB_URI?.trim();
 
-  if (uri) {
-    connectionMode = 'external';
-  } else {
-    connectionMode = 'embedded';
-    const dbPath = path.resolve(process.cwd(), '.data', 'mongodb');
-    fs.mkdirSync(dbPath, { recursive: true });
-
-    // Clean stale lock file if container restarted unexpectedly
-    const lockPath = path.join(dbPath, 'mongod.lock');
-    if (fs.existsSync(lockPath)) {
-      try {
-        const lockContent = fs.readFileSync(lockPath, 'utf8').trim();
-        if (!lockContent) {
-          fs.unlinkSync(lockPath);
+      if (uri) {
+        globalForMongo.__shopAdminConnectionMode = 'external';
+      } else {
+        if (process.env.VERCEL || process.env.NODE_ENV === 'production') {
+          throw new Error(
+            'MONGODB_URI environment variable is missing. Please add MONGODB_URI in your deployment environment variables.'
+          );
         }
-      } catch {
-        // Ignore lock cleanup failure
-      }
-    }
+        globalForMongo.__shopAdminConnectionMode = 'embedded';
+        const dbPath = path.resolve(process.cwd(), '.data', 'mongodb');
+        fs.mkdirSync(dbPath, { recursive: true });
 
-    memoryServer = await MongoMemoryServer.create({
-      instance: {
-        dbPath,
-        storageEngine: 'wiredTiger',
+        // Clean stale lock file if container restarted unexpectedly
+        const lockPath = path.join(dbPath, 'mongod.lock');
+        if (fs.existsSync(lockPath)) {
+          try {
+            const lockContent = fs.readFileSync(lockPath, 'utf8').trim();
+            if (!lockContent) {
+              fs.unlinkSync(lockPath);
+            }
+          } catch {
+            // Ignore lock cleanup failure
+          }
+        }
+
+        const memoryPkg = 'mongodb-memory-server';
+        const { MongoMemoryServer } = (await import(memoryPkg)) as {
+          MongoMemoryServer: {
+            create: (opts: unknown) => Promise<MemoryServerInstance>;
+          };
+        };
+        const mem = await MongoMemoryServer.create({
+          instance: {
+            dbPath,
+            storageEngine: 'wiredTiger',
+            dbName: 'ecom_store',
+          },
+        });
+        globalForMongo.__shopAdminMemoryServer = mem;
+        uri = mem.getUri('ecom_store');
+      }
+
+      const maxPoolSize = Number(
+        process.env.MONGODB_MAX_POOL_SIZE || (process.env.VERCEL ? 15 : 25)
+      );
+
+      return mongoose.connect(uri, {
         dbName: 'ecom_store',
-      },
+        maxPoolSize,
+        minPoolSize: process.env.VERCEL ? 1 : 2,
+        serverSelectionTimeoutMS: 8000,
+        socketTimeoutMS: 45000,
+        maxIdleTimeMS: 30000,
+      });
+    })().catch((err) => {
+      globalForMongo.__shopAdminMongoPromise = null;
+      throw err;
     });
-    uri = memoryServer.getUri('ecom_store');
   }
 
-  await mongoose.connect(uri, {
-    dbName: 'ecom_store',
-  });
+  await globalForMongo.__shopAdminMongoPromise;
 
-  await ensureCoreSystemConfig();
+  if (!globalForMongo.__shopAdminCoreInitPromise) {
+    globalForMongo.__shopAdminCoreInitPromise = ensureCoreSystemConfig().catch((err) => {
+      globalForMongo.__shopAdminCoreInitPromise = null;
+      throw err;
+    });
+  }
+  await globalForMongo.__shopAdminCoreInitPromise;
 }
 
 function mapAdminRoleToUserRole(role?: string): 'super_admin' | 'admin' | 'manager' {
@@ -163,9 +214,11 @@ async function ensureCoreSystemConfig() {
 }
 
 export async function disconnectMongoDB() {
+  globalForMongo.__shopAdminMongoPromise = null;
+  globalForMongo.__shopAdminCoreInitPromise = null;
   await mongoose.disconnect();
-  if (memoryServer) {
-    await memoryServer.stop();
-    memoryServer = null;
+  if (globalForMongo.__shopAdminMemoryServer) {
+    await globalForMongo.__shopAdminMemoryServer.stop();
+    globalForMongo.__shopAdminMemoryServer = null;
   }
 }

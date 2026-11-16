@@ -1,11 +1,33 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
 import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
-    plugins: [react(), tailwindcss()],
+    plugins: [
+      react(),
+      tailwindcss(),
+      {
+        name: 'shopadmin-entry-routing-layout',
+        apply: 'build',
+        closeBundle(error?: Error): void {
+          if (error) return;
+          const distDir = path.resolve(__dirname, 'dist');
+          const builtRootAdmin = path.join(distDir, 'index.html');
+          const builtCustomer = path.join(distDir, 'customer_web', 'index.html');
+          const targetAdmin = path.join(distDir, 'admin.html');
+          const targetCustomer = path.join(distDir, 'index.html');
+
+          if (fs.existsSync(builtRootAdmin) && fs.existsSync(builtCustomer)) {
+            fs.renameSync(builtRootAdmin, targetAdmin);
+            fs.renameSync(builtCustomer, targetCustomer);
+            fs.rmSync(path.join(distDir, 'customer_web'), { recursive: true, force: true });
+          }
+        },
+      },
+    ],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),

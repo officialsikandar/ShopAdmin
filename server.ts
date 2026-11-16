@@ -1,32 +1,25 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
-import dotenv from 'dotenv';
 import { connectToMongoDB } from './server/db.ts';
-import { createApiRouter } from './server/routes.ts';
-
-dotenv.config();
+import { createApiApp } from './server/app.ts';
 
 async function startServer() {
   await connectToMongoDB();
 
-  const app = express();
+  const app = createApiApp();
   const port = Number(process.env.PORT || 3000);
-
-  app.use(express.json({ limit: '10mb' }));
-  app.use('/uploads', express.static(path.resolve(process.cwd(), 'uploads')));
-  app.use('/api', createApiRouter());
 
   if (process.env.NODE_ENV === 'production') {
     const distPath = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distPath, { index: false }));
 
     app.get(['/admin', '/admin/*'], (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      res.sendFile(path.join(distPath, 'admin.html'));
     });
 
     app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'customer_web/index.html'));
+      res.sendFile(path.join(distPath, 'index.html'));
     });
   } else {
     const { createServer: createViteServer } = await import('vite');
